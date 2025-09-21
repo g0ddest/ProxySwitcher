@@ -24,12 +24,21 @@ struct ProxyToggleApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var proxyMonitor: ProxyMonitor?
+    var pathMonitor: NWPathMonitor?
+
+    private var vpnLikelyActive: Bool = false {
+        didSet {
+            DispatchQueue.main.async {
+                self.updateStatusIcon()
+            }
+        }
+    }
+
+    private var lastKnownProxyEnabled: Bool = false
 
     func applicationDidFinishLaunching(_: Notification) {
-        // Убираем иконку из Дока и Cmd-Tab (альтернатива — LSUIElement=YES в Info.plist)
         NSApp.setActivationPolicy(.accessory)
 
-        // Создаем элемент в строке меню
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
@@ -39,13 +48,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        // Запускаем мониторинг изменений прокси
         proxyMonitor = ProxyMonitor { [weak self] in
             DispatchQueue.main.async {
                 self?.updateStatusIcon()
             }
         }
         proxyMonitor?.startMonitoring()
+
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            var hasOther = false
+            for iface in path.availableInterfaces {
+                if iface.type == .other {
+                    hasOther = true
+                    break
+                }
+            }
+            self?.vpnLikelyActive = (path.status == .satisfied && hasOther)
+        }
+        let queue = DispatchQueue(label: "nwpath.monitor.queue")
+        monitor.start(queue: queue)
     }
 
     @objc
@@ -53,10 +76,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let event = NSApp.currentEvent!
 
         if event.type == .rightMouseUp {
-            // Правый клик - показываем меню
             showMenu()
         } else {
-            // Левый клик - переключаем прокси
             toggleProxy()
         }
     }
@@ -67,11 +88,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let proxyEnabled = ProxyManager.shared.isProxyEnabled()
-        let iconName = proxyEnabled ? "network" : "network.slash"
+
+        if vpnLikelyActive {
+            let iconName = lastKnownProxyEnabled ? "shield.fill" : "shield"
+            button.image = NSImage(systemSymbolName: iconName, accessibilityDescription: nil)
+            button.toolTip = "VPN detected. Proxy configuration can be changed only with VPN disabled."
+            return
+        }
+
+        lastKnownProxyEnabled = proxyEnabled
+
+        let iconName = proxyEnabled ? "network.slash" : "network"
         button.image = NSImage(systemSymbolName: iconName, accessibilityDescription: nil)
+        button.toolTip = proxyEnabled ? "Proxy enabled" : "Proxy disabled"
     }
 
     func toggleProxy() {
+        if vpnLikelyActive {
+            print("VPN is active. Skipping proxy changes. Disable VPN client to apply changes.")
+            updateStatusIcon()
+            return
+        }
+
         ProxyManager.shared.toggleProxy()
         updateStatusIcon()
     }
@@ -79,20 +117,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func showMenu() {
         let menu = NSMenu()
 
-        let proxyItems = ProxyManager.shared.getProxyInfo()
-        if proxyItems.isEmpty {
-            let infoItem = NSMenuItem(title: "Proxy is disabled", action: nil, keyEquivalent: "")
-            infoItem.isEnabled = false
-            menu.addItem(infoItem)
+        let vpnTitle = vpnLikelyActive ? "VPN: Active" : "VPN: Inactive"
+        let vpnItem = NSMenuItem(title: vpnTitle, action: nil, keyEquivalent: "")
+        vpnItem.isEnabled = false
+        menu.addItem(vpnItem)
+
+        if vpnLikelyActive {
+            let warn = NSMenuItem(title: "On active VPN proxy settings do not apply.", action: nil, keyEquivalent: "")
+            warn.isEnabled = false
+            menu.addItem(warn)
+
+            let advise = NSMenuItem(title: "To apply proxy changes, disable VPN.", action: nil, keyEquivalent: "")
+            advise.isEnabled = false
+            menu.addItem(advise)
+
+            menu.addItem(NSMenuItem.separator())
         } else {
-            for item in proxyItems {
-                let infoItem = NSMenuItem(title: item, action: nil, keyEquivalent: "")
+            menu.addItem(NSMenuItem.separator())
+
+            let proxyItems = ProxyManager.shared.getProxyInfo()
+            if proxyItems.isEmpty {
+                let infoItem = NSMenuItem(title: "Proxy is disabled (global)", action: nil, keyEquivalent: "")
                 infoItem.isEnabled = false
                 menu.addItem(infoItem)
+            } else {
+                for item in proxyItems {
+                    let infoItem = NSMenuItem(title: item, action: nil, keyEquivalent: "")
+                    infoItem.isEnabled = false
+                    menu.addItem(infoItem)
+                }
             }
-        }
 
-        menu.addItem(NSMenuItem.separator())
+            menu.addItem(NSMenuItem.separator())
+        }
 
         // Кнопка выхода
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
@@ -167,27 +224,73 @@ class ProxyManager {
     }
 
     func getProxyInfo() -> [String] {
-        guard let proxies = SCDynamicStoreCopyProxies(nil) as? [String: Any] else {
-            return []
-        }
-
         var items: [String] = []
 
-        let httpEnabled = proxies[kSCPropNetProxiesHTTPEnable as String] as? Int == 1
-        if httpEnabled {
-            if let host = proxies[kSCPropNetProxiesHTTPProxy as String] as? String,
-               let port = proxies[kSCPropNetProxiesHTTPPort as String] as? Int,
-               !host.isEmpty, port > 0 {
-                items.append("http: \(host):\(port)")
+        if let proxies = SCDynamicStoreCopyProxies(nil) as? [String: Any] {
+            let httpEnabled = proxies[kSCPropNetProxiesHTTPEnable as String] as? Int == 1
+            let httpsEnabled = proxies[kSCPropNetProxiesHTTPSEnable as String] as? Int == 1
+
+            if httpEnabled {
+                if let host = proxies[kSCPropNetProxiesHTTPProxy as String] as? String,
+                   let port = proxies[kSCPropNetProxiesHTTPPort as String] as? Int,
+                   !host.isEmpty, port > 0 {
+                    items.append("global http: \(host):\(port)")
+                } else {
+                    items.append("global http: enabled (no host/port)")
+                }
+            }
+
+            if httpsEnabled {
+                if let host = proxies[kSCPropNetProxiesHTTPSProxy as String] as? String,
+                   let port = proxies[kSCPropNetProxiesHTTPSPort as String] as? Int,
+                   !host.isEmpty, port > 0 {
+                    items.append("global https: \(host):\(port)")
+                } else {
+                    items.append("global https: enabled (no host/port)")
+                }
             }
         }
 
-        let httpsEnabled = proxies[kSCPropNetProxiesHTTPSEnable as String] as? Int == 1
-        if httpsEnabled {
-            if let host = proxies[kSCPropNetProxiesHTTPSProxy as String] as? String,
-               let port = proxies[kSCPropNetProxiesHTTPSPort as String] as? Int,
-               !host.isEmpty, port > 0 {
-                items.append("https: \(host):\(port)")
+        if let auth = obtainAuthorization(interactive: false),
+           let preferences = SCPreferencesCreateWithAuthorization(nil, "ProxyToggleRead" as CFString, nil, auth),
+           let allServices = SCNetworkServiceCopyAll(preferences) as? [SCNetworkService] {
+            let services = allServices.filter { service in
+                guard let iface = SCNetworkServiceGetInterface(service) else {
+                    return false
+                }
+                let enabled = SCNetworkServiceGetEnabled(service)
+                let bsdName = SCNetworkInterfaceGetBSDName(iface) as String? ?? ""
+                return enabled && !bsdName.isEmpty
+            }
+
+            for service in services {
+                if let iface = SCNetworkServiceGetInterface(service) {
+                    let bsdName = SCNetworkInterfaceGetBSDName(iface) as String? ?? "iface"
+                    if let protocolConfig = SCNetworkServiceCopyProtocol(service, kSCNetworkProtocolTypeProxies),
+                       let proxyConfig = SCNetworkProtocolGetConfiguration(protocolConfig) as? [String: Any] {
+                        let httpEnabled = proxyConfig[kSCPropNetProxiesHTTPEnable as String] as? Int == 1
+                        let httpsEnabled = proxyConfig[kSCPropNetProxiesHTTPSEnable as String] as? Int == 1
+
+                        if httpEnabled {
+                            let host = proxyConfig[kSCPropNetProxiesHTTPProxy as String] as? String ?? ""
+                            let port = proxyConfig[kSCPropNetProxiesHTTPPort as String] as? Int ?? 0
+                            if !host.isEmpty, port > 0 {
+                                items.append("\(bsdName) http: \(host):\(port)")
+                            } else {
+                                items.append("\(bsdName) http: enabled (no host/port)")
+                            }
+                        }
+                        if httpsEnabled {
+                            let host = proxyConfig[kSCPropNetProxiesHTTPSProxy as String] as? String ?? ""
+                            let port = proxyConfig[kSCPropNetProxiesHTTPSPort as String] as? Int ?? 0
+                            if !host.isEmpty, port > 0 {
+                                items.append("\(bsdName) https: \(host):\(port)")
+                            } else {
+                                items.append("\(bsdName) https: enabled (no host/port)")
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -197,13 +300,11 @@ class ProxyManager {
     func toggleProxy() {
         let currentEnabled = isProxyEnabled()
 
-        // Получаем/запрашиваем права
         guard let authRef = obtainAuthorization(interactive: true) else {
             print("Authorization not granted. Aborting toggle.")
             return
         }
 
-        // Создаем SCPreferences с авторизацией
         guard let preferences = SCPreferencesCreateWithAuthorization(nil, "ProxyToggle" as CFString, nil, authRef) else {
             print("SCPreferencesCreateWithAuthorization failed")
             return
@@ -214,12 +315,12 @@ class ProxyManager {
             return
         }
 
-        // Фильтруем только активные сервисы с интерфейсом (Wi‑Fi/Еthernet)
         let services = allServices.filter { service in
-            guard SCNetworkServiceGetInterface(service) != nil else {
+            guard let iface = SCNetworkServiceGetInterface(service) else {
                 return false
             }
-            return SCNetworkServiceGetEnabled(service)
+            let bsdName = SCNetworkInterfaceGetBSDName(iface) as String? ?? ""
+            return SCNetworkServiceGetEnabled(service) && !bsdName.isEmpty
         }
 
         var anyChange = false
@@ -237,8 +338,6 @@ class ProxyManager {
                 continue
             }
 
-            // Включаем/выключаем флаги независимо от наличия значений хоста/порта.
-            // Предполагаем, что host/port уже заданы в системе пользователем.
             mutableConfig[kSCPropNetProxiesHTTPEnable as String] = currentEnabled ? 0 : 1
             mutableConfig[kSCPropNetProxiesHTTPSEnable as String] = currentEnabled ? 0 : 1
 
@@ -306,8 +405,19 @@ class ProxyMonitor {
             return
         }
 
-        let keys = ["State:/Network/Global/Proxies"] as CFArray
-        SCDynamicStoreSetNotificationKeys(store, keys, nil)
+        let keys = [
+            "State:/Network/Global/Proxies",
+            "State:/Network/Global/IPv4",
+            "State:/Network/Global/IPv6",
+            "State:/Network/Global/DNS"
+        ] as CFArray
+
+        let patterns = [
+            "State:/Network/Service/.*/Proxies",
+            "Setup:/Network/Service/.*/Proxies"
+        ] as CFArray
+
+        SCDynamicStoreSetNotificationKeys(store, keys, patterns)
 
         let runLoopSource = SCDynamicStoreCreateRunLoopSource(nil, store, 0)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .defaultMode)
